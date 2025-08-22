@@ -1,8 +1,6 @@
 # -*- mode: ruby -*-
 # vi:set ft=ruby sw=2 ts=2 sts=2:
 
-# Define the number of master and worker nodes
-# If this number is changed, remember to update setup-hosts.sh script with the new hosts IP details in /etc/hosts of each VM.
 NUM_MASTER_NODE = 1
 NUM_WORKER_NODE = 2
 
@@ -10,88 +8,92 @@ IP_NW = "192.168.56."
 MASTER_IP_START = 1
 NODE_IP_START = 2
 
-# All Vagrant configuration is done below. The "2" in Vagrant.configure
-# configures the configuration version (we support older styles for
-# backwards compatibility). Please don't change it unless you know what
-# you're doing.
+BOX = "ubuntu/jammy64"   # upgraded from bionic for modern k8s
+
 Vagrant.configure("2") do |config|
-  # The most common configuration options are documented and commented below.
-  # For a complete reference, please see the online documentation at
-  # https://docs.vagrantup.com.
-
-  # Every Vagrant development environment requires a box. You can search for
-  # boxes at https://vagrantcloud.com/search.
-  # config.vm.box = "base"
-  config.vm.box = "ubuntu/bionic64"
-
-  # Disable automatic box update checking. If you disable this, then
-  # boxes will only be checked for updates when the user runs
-  # `vagrant box outdated`. This is not recommended.
+  config.vm.box = BOX
   config.vm.box_check_update = false
 
-  # Create a public network, which generally matched to bridged network.
-  # Bridged networks make the machine appear as another physical device on
-  # your network.
-  # config.vm.network "public_network"
+  # Common provisioning for ALL nodes
+  common_bootstrap = <<-SHELL
+    set -euxo pipefail
+    export DEBIAN_FRONTEND=noninteractive
 
-  # Share an additional folder to the guest VM. The first argument is
-  # the path on the host to the actual folder. The second argument is
-  # the path on the guest to mount the folder. And the optional third
-  # argument is a set of non-required options.
-  # config.vm.synced_folder "../data", "/vagrant_data"
+    # Basic tooling
+    apt-get update -y
+    apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
 
-  # Provider-specific configuration so you can fine-tune various
-  # backing providers for Vagrant. These expose provider-specific options.
-  # Example for VirtualBox:
-  #
-  # config.vm.provider "virtualbox" do |vb|
-  #   # Customize the amount of memory on the VM:
-  #   vb.memory = "1024"
-  # end
-  #
-  # View the documentation for the provider you are using for more
-  # information on available options.
+    # Disable swap (required for kubeadm’s default path)
+    swapoff -a
+    sed -ri 's/(^\\S+\\s+\\S+\\s+swap\\s+\\S+\\s+\\S+\\s+\\S+)/# \\1/' /etc/fstab
 
-  # Provision Master Nodes
+    # Kernel modules + sysctls for container networking
+    cat <<EOF | tee /etc/modules-load.d/containerd.conf
+overlay
+br_netfilter
+EOF
+    modprobe overlay
+    modprobe br_netfilter
+    cat <<EOF | tee /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+    sysctl --system
+
+    # Install and configure containerd (systemd cgroups)
+    apt-get install -y containerd
+    mkdir -p /etc/containerd
+    containerd config default | tee /etc/containerd/config.toml > /dev/null
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    systemctl enable --now containerd
+
+    # Kubernetes apt repo (v1.33 stable) + tools
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /" \
+      | tee /etc/apt/sources.list.d/kubernetes.list
+    apt-get update -y
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+    systemctl enable kubelet
+
+    # /etc/hosts convenience
+    grep -q kubemaster /etc/hosts || cat <<EOT >> /etc/hosts
+#{IP_NW}#{MASTER_IP_START + 1} kubemaster
+#{IP_NW}#{NODE_IP_START + 1} kubenode01
+#{IP_NW}#{NODE_IP_START + 2} kubenode02
+EOT
+  SHELL
+
+  # Master
   (1..NUM_MASTER_NODE).each do |i|
-      config.vm.define "kubemaster" do |node|
-        # Name shown in the GUI
-        node.vm.provider "virtualbox" do |vb|
-            vb.name = "kubemaster"
-            vb.memory = 2048
-            vb.cpus = 2
-        end
-        node.vm.hostname = "kubemaster"
-        node.vm.network :private_network, ip: IP_NW + "#{MASTER_IP_START + i}"
-        node.vm.network "forwarded_port", guest: 22, host: "#{2710 + i}"
-
-        node.vm.provision "setup-hosts", :type => "shell", :path => "ubuntu/vagrant/setup-hosts.sh" do |s|
-          s.args = ["enp0s8"]
-        end
-
-        node.vm.provision "setup-dns", type: "shell", :path => "ubuntu/update-dns.sh"
-
+    config.vm.define "kubemaster" do |node|
+      node.vm.provider "virtualbox" do |vb|
+        vb.name = "kubemaster"
+        vb.memory = 3072     # 2GB works; 3GB is smoother for the control plane
+        vb.cpus = 2
       end
+      node.vm.hostname = "kubemaster"
+      node.vm.network :private_network, ip: IP_NW + "#{MASTER_IP_START + i}"  # 192.168.56.2
+      node.vm.network "forwarded_port", guest: 22, host: "#{2710 + i}"
+      node.vm.provision "shell", inline: common_bootstrap
+    end
   end
 
-
-  # Provision Worker Nodes
+  # Workers
   (1..NUM_WORKER_NODE).each do |i|
     config.vm.define "kubenode0#{i}" do |node|
-        node.vm.provider "virtualbox" do |vb|
-            vb.name = "kubenode0#{i}"
-            vb.memory = 2048
-            vb.cpus = 2
-        end
-        node.vm.hostname = "kubenode0#{i}"
-        node.vm.network :private_network, ip: IP_NW + "#{NODE_IP_START + i}"
-                node.vm.network "forwarded_port", guest: 22, host: "#{2720 + i}"
-
-        node.vm.provision "setup-hosts", :type => "shell", :path => "ubuntu/vagrant/setup-hosts.sh" do |s|
-          s.args = ["enp0s8"]
-        end
-
-        node.vm.provision "setup-dns", type: "shell", :path => "ubuntu/update-dns.sh"
+      node.vm.provider "virtualbox" do |vb|
+        vb.name = "kubenode0#{i}"
+        vb.memory = 2048
+        vb.cpus = 2
+      end
+      node.vm.hostname = "kubenode0#{i}"
+      node.vm.network :private_network, ip: IP_NW + "#{NODE_IP_START + i}"  # .3 and .4
+      node.vm.network "forwarded_port", guest: 22, host: "#{2720 + i}"
+      node.vm.provision "shell", inline: common_bootstrap
     end
   end
 end
